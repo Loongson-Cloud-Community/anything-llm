@@ -1,0 +1,142 @@
+# Setup base image
+FROM cr.loongnix.cn/library/debian:buster AS base
+
+# Build arguments
+ARG ARG_UID=1000
+ARG ARG_GID=1000
+
+#############################################
+
+# amd64-specific stage
+FROM base AS build-loong64
+RUN echo "Preparing build of AnythingLLM image for non-ARM architecture"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install system dependencies
+# hadolint ignore=DL3008,DL3013
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+        curl gnupg libgfortran5 libgbm1 tzdata netcat \
+        libasound2 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 \
+        libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 \
+        libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+        libxss1 libxtst6 ca-certificates fonts-liberation libappindicator1 libnss3 lsb-release \
+        xdg-utils git build-essential ffmpeg wget
+
+## 安装nodejs-18:http://ftp.loongnix.cn/nodejs/LoongArch/dist/v18.19.1/node-v18.19.1-linux-loong64.tar.gz
+RUN wget -q -O node-v18.19.1-linux-loong64.tar.gz http://ftp.loongnix.cn/nodejs/LoongArch/dist/v18.19.1/node-v18.19.1-linux-loong64.tar.gz \
+    && tar xf node-v18.19.1-linux-loong64.tar.gz \
+    && mv node-v18.19.1-linux-loong64/ /nodejs
+    
+ENV PATH="/nodejs/bin:$PATH"
+# RUN apt install nodejs -y
+
+## 安装yarn
+RUN curl -LO https://github.com/yarnpkg/yarn/releases/download/v1.22.19/yarn_1.22.19_all.deb \
+        && dpkg -i yarn_1.22.19_all.deb \
+        && rm yarn_1.22.19_all.deb
+
+ARG ARG_UID=1000
+ARG ARG_GID=1000
+RUN echo "ARG_GID=$ARG_GID"
+
+# Create a group and user with specific UID and GID
+RUN groupadd -g "$ARG_GID" anythingllm && \
+    useradd -l -u "$ARG_UID" -m -d /app -s /bin/bash -g anythingllm anythingllm && \
+    mkdir -p /app/frontend/ /app/server/ /app/collector/ && chown -R anythingllm:anythingllm /app
+
+# Copy docker helper scripts
+COPY ./docker/docker-entrypoint.sh /usr/local/bin/
+COPY ./docker/docker-healthcheck.sh /usr/local/bin/
+COPY --chown=anythingllm:anythingllm ./docker/.env.example /app/server/.env
+
+# Ensure the scripts are executable
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
+    chmod +x /usr/local/bin/docker-healthcheck.sh
+
+#############################################
+# COMMON BUILD FLOW FOR ALL ARCHS
+#############################################
+
+# hadolint ignore=DL3006
+FROM build-loong64 AS build
+RUN echo "Running common build flow of AnythingLLM image for all architectures"
+
+USER anythingllm
+WORKDIR /app
+
+# Install frontend dependencies
+## 这里可能需要修改代理删除"*.lock"文件
+FROM build AS frontend-deps
+
+## 删除了.lock文件
+## 配置龙芯仓库
+RUN npm config set registry https://registry.loongnix.cn:4873
+RUN echo "PATH=$PATH"
+COPY ./frontend/package.json ./frontend/
+WORKDIR /app/frontend
+
+## 测试
+RUN yarn install --network-timeout 100000 && yarn cache clean
+WORKDIR /app
+# 
+# Install server dependencies
+FROM build AS server-deps
+COPY ./server/package.json ./server/
+WORKDIR /app/server
+
+## 配置一下龙芯的yarn源
+RUN yarn config set registry https://registry.loongnix.cn:4873
+
+# RUN yarn install --verbose --production --network-timeout 100000 && yarn cache clean
+# WORKDIR /app
+
+# # Compile Llama.cpp bindings for node-llama-cpp for this operating system.
+# USER root
+# WORKDIR /app/server
+# RUN npx --no node-llama-cpp download
+# WORKDIR /app
+# USER anythingllm
+# 
+# # Build the frontend
+# FROM frontend-deps AS build-stage
+# COPY ./frontend/ ./frontend/
+# WORKDIR /app/frontend
+# RUN yarn build && yarn cache clean
+# WORKDIR /app
+# 
+# # Setup the server
+# FROM server-deps AS production-stage
+# COPY --chown=anythingllm:anythingllm ./server/ ./server/
+# 
+# # Copy built static frontend files to the server public directory
+# COPY --chown=anythingllm:anythingllm --from=build-stage /app/frontend/dist ./server/public
+# 
+# # Copy the collector
+# COPY --chown=anythingllm:anythingllm ./collector/ ./collector/
+# 
+# # Install collector dependencies
+# WORKDIR /app/collector
+# ENV PUPPETEER_DOWNLOAD_BASE_URL=https://storage.googleapis.com/chrome-for-testing-public 
+# RUN yarn install --production --network-timeout 100000 && yarn cache clean
+# 
+# # Migrate and Run Prisma against known schema
+# WORKDIR /app/server
+# RUN npx prisma generate --schema=./prisma/schema.prisma && \
+#     npx prisma migrate deploy --schema=./prisma/schema.prisma
+# WORKDIR /app
+# 
+# # Setup the environment
+# ENV NODE_ENV=production
+# ENV ANYTHING_LLM_RUNTIME=docker
+# 
+# # Expose the server port
+# EXPOSE 3001
+# 
+# # Setup the healthcheck
+# HEALTHCHECK --interval=1m --timeout=10s --start-period=1m \
+#   CMD /bin/bash /usr/local/bin/docker-healthcheck.sh || exit 1
+# 
+# # Run the server
+# ENTRYPOINT ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
